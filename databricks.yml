@@ -1,0 +1,132 @@
+# databricks.yml
+# Databricks Asset Bundle (DAB) configuration.
+# Defines notebooks, jobs, and targets for dev / staging / prod deployment.
+# Deploy with: databricks bundle deploy --target <env>
+
+bundle:
+  name: spotify-azure-pipeline
+
+variables:
+  storage_account:
+    description: "Azure Data Lake Storage Gen2 account name"
+    default: "yourstorageacct"
+  catalog:
+    description: "Unity Catalog name"
+    default: "spotify_catalog"
+
+# ── Artifacts (notebooks as source files) ──────────────────────────────────
+artifacts:
+  notebooks:
+    type: notebook
+    path: ./notebooks
+
+# ── Resources ───────────────────────────────────────────────────────────────
+resources:
+  jobs:
+
+    # ── Main pipeline job ────────────────────────────────────────────────────
+    spotify_daily_pipeline:
+      name: "Spotify Daily Pipeline — ${bundle.target}"
+      description: "Bronze → Silver → Gold incremental pipeline"
+
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"   # 5 AM UTC daily
+        timezone_id: "UTC"
+        pause_status: UNPAUSED
+
+      job_clusters:
+        - job_cluster_key: pipeline_cluster
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 2
+            spark_conf:
+              spark.storage.account: "${var.storage_account}"
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.autoCompact.enabled: "true"
+            azure_attributes:
+              availability: ON_DEMAND_AZURE
+
+      tasks:
+        - task_key: bronze_autoloader
+          job_cluster_key: pipeline_cluster
+          notebook_task:
+            notebook_path: ./notebooks/bronze_autoloader.py
+            source: WORKSPACE
+          timeout_seconds: 1800
+
+        - task_key: silver_dimensions
+          depends_on:
+            - task_key: bronze_autoloader
+          job_cluster_key: pipeline_cluster
+          notebook_task:
+            notebook_path: ./silver_dimensions.ipynb
+            source: WORKSPACE
+          timeout_seconds: 3600
+
+        - task_key: gold_fact_streams
+          depends_on:
+            - task_key: silver_dimensions
+          job_cluster_key: pipeline_cluster
+          notebook_task:
+            notebook_path: ./notebooks/gold_fact_streams.py
+            source: WORKSPACE
+          timeout_seconds: 3600
+
+        - task_key: data_quality_checks
+          depends_on:
+            - task_key: gold_fact_streams
+          job_cluster_key: pipeline_cluster
+          notebook_task:
+            notebook_path: ./notebooks/data_quality_checks.py
+            source: WORKSPACE
+
+      email_notifications:
+        on_failure:
+          - data-alerts@yourorg.com
+
+# ── Targets (environments) ───────────────────────────────────────────────────
+targets:
+
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-<your-dev-workspace-id>.azuredatabricks.net
+    variables:
+      catalog: "spotify_catalog_dev"
+    resources:
+      jobs:
+        spotify_daily_pipeline:
+          schedule:
+            pause_status: PAUSED      # don't run on schedule in dev
+          job_clusters:
+            - job_cluster_key: pipeline_cluster
+              new_cluster:
+                num_workers: 1        # smaller cluster in dev
+
+  staging:
+    workspace:
+      host: https://adb-<your-staging-workspace-id>.azuredatabricks.net
+    variables:
+      catalog: "spotify_catalog_staging"
+    resources:
+      jobs:
+        spotify_daily_pipeline:
+          schedule:
+            pause_status: PAUSED      # trigger manually in staging for QA
+
+  prod:
+    workspace:
+      host: https://adb-<your-prod-workspace-id>.azuredatabricks.net
+    variables:
+      catalog: "spotify_catalog"
+    resources:
+      jobs:
+        spotify_daily_pipeline:
+          schedule:
+            pause_status: UNPAUSED    # runs on schedule in prod
+          job_clusters:
+            - job_cluster_key: pipeline_cluster
+              new_cluster:
+                num_workers: 4        # scale up for prod
